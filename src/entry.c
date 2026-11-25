@@ -1,12 +1,10 @@
-#include <stdatomic.h>
 #include "render.h"
 
 #ifndef MHGU_SHARPNESS_PROBE
-// The gameplay/presentation thread owns all pointers into the player graph.
-// Only raw gauge values cross the boundary to the render worker.
-static atomic_flag lock = ATOMIC_FLAG_INIT;
-static bool visible;
-static Sharpness latest;
+#include "snapshot.h"
+
+// Only raw values cross the gameplay/render thread boundary.
+static SharpnessSnapshot latest;
 #endif
 
 void sharpness_sample(uintptr_t base) {
@@ -15,11 +13,7 @@ void sharpness_sample(uintptr_t base) {
 #else
     Sharpness next;
     bool valid = sharpness_read(base, &next);
-    while (atomic_flag_test_and_set_explicit(&lock, memory_order_acquire))
-        __asm__ volatile("yield");
-    visible = valid;
-    if (valid) latest = next;
-    atomic_flag_clear_explicit(&lock, memory_order_release);
+    snapshot_publish(&latest, valid ? &next : 0);
 #endif
 }
 
@@ -27,12 +21,8 @@ void sharpness_present(uintptr_t base, void *commands) {
 #ifdef MHGU_SHARPNESS_PROBE
     sharpness_draw_probe(base, commands);
 #else
-    if (atomic_flag_test_and_set_explicit(&lock, memory_order_acquire)) return;
-    bool draw = visible;
     Sharpness copy;
-    if (draw) copy = latest;
-    atomic_flag_clear_explicit(&lock, memory_order_release);
-    if (draw) sharpness_draw(base, commands, &copy);
+    if (snapshot_read(&latest, &copy)) sharpness_draw(base, commands, &copy);
 #endif
 }
 

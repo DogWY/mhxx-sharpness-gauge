@@ -59,9 +59,65 @@ static bool melee_hunter(uintptr_t vtable_offset) {
     }
 }
 
-typedef int (*TierAt)(uintptr_t hunter, int points);
+typedef uintptr_t (*FindWeapon)(uintptr_t registry, uintptr_t item);
+typedef unsigned (*GetValue)(uintptr_t self);
+typedef uintptr_t (*GetLevel)(uintptr_t weapon, unsigned level);
+typedef int (*TierAt)(uintptr_t self, unsigned points);
 
-static bool read_with_tier(uintptr_t base, TierAt tier_at, Sharpness *out) {
+static uint32_t method(uintptr_t self, unsigned offset) {
+    uintptr_t vtable = object_at(self);
+    return vtable ? word(vtable + offset) : 0;
+}
+
+static void fixed_tier(Sharpness *state, unsigned color) {
+    if (color > 6) color = 6;
+    for (unsigned i = 0; i < 7; ++i)
+        state->end[i] = i < color ? 0 : state->maximum;
+}
+
+/* Retail sub_6029CDFC delegates to a weapon level's +132 tier method.
+ * All eleven melee classes use sub_600F4794 with sub_600F4724 at +128:
+ * the former compares points against cumulative thresholds; the latter
+ * uses the level's +32 row index and the registry's rKireajiData.
+ * Read that row once per sample, including changes made in-place.
+ * For a different implementation, ask its actual tier method. */
+static bool level_ends(uintptr_t base, uintptr_t registry, uintptr_t level,
+                       Sharpness *state) {
+    uintptr_t tier_method = method(level, 132);
+    if (tier_method == base + 0xf4794 && method(level, 128) == base + 0xf4724) {
+        uintptr_t resource = object_at(registry + 252);
+        if (!resource) return false;
+        GetValue get_index = (GetValue)method(level, 32);
+        if (!get_index) return false;
+        unsigned index = get_index(level);
+        if (index >= word(resource + 100)) return false;
+        uintptr_t rows = object_at(resource + 108);
+        if (!rows) return false;
+        uintptr_t ends = rows + 20 * index + 4; /* sub_6013F290 */
+        for (unsigned i = 0; i < 6; ++i) {
+            uint32_t end = *(volatile const uint16_t *)(ends + 2*i);
+            state->end[i] = end < state->maximum ? end : state->maximum;
+        }
+    } else {
+        if (!tier_method) return false;
+        TierAt tier_at = (TierAt)tier_method;
+        uint32_t start = 0;
+        for (int tier = 0; tier < 6; ++tier) {
+            uint32_t lo = start, hi = state->maximum;
+            while (lo < hi) {
+                uint32_t mid = lo + (hi - lo + 1) / 2;
+                if (tier_at(level, mid) <= tier) lo = mid;
+                else hi = mid - 1;
+            }
+            state->end[tier] = lo;
+            start = lo;
+        }
+    }
+    state->end[6] = state->maximum;
+    return true;
+}
+
+static bool read_with_weapon(uintptr_t base, FindWeapon find_weapon, Sharpness *out) {
     if (!base || !out || !gameplay_hud_visible(base)) return false;
 
     /* Retail sub_60276278 -> sub_603F8398: use the local multiplayer
@@ -85,29 +141,40 @@ static bool read_with_tier(uintptr_t base, TierAt tier_at, Sharpness *out) {
     };
     if (!state.maximum || state.current > state.maximum || state.color > 6)
         HIDE("sharpness-invalid", hunter_class, &state);
-    /* Retail sub_6029CDFC looks up the weapon's equipped sharpness row.
-     * Its tier increases monotonically with remaining points. Find each
-     * boundary without retaining equipment pointers across frames. */
     if (state.maximum > 4096) HIDE("sharpness-range", hunter_class, &state);
-    if (!object_at(hunter + 5060)) HIDE("equipment-missing", hunter_class, &state);
-    if (!object_at(base + 0x1856b18)) HIDE("weapon-table-missing", hunter_class, &state);
-    uint32_t start = 0;
-    for (int tier = 0; tier < 6; ++tier) {
-        uint32_t lo = start, hi = state.maximum;
-        while (lo < hi) {
-            uint32_t mid = lo + (hi - lo + 1) / 2;
-            if (tier_at(hunter, (int)mid) <= tier) lo = mid;
-            else hi = mid - 1;
-        }
-        state.end[tier] = lo;
-        start = lo;
+    uintptr_t equipment = object_at(hunter + 5060);
+    if (!equipment) HIDE("equipment-missing", hunter_class, &state);
+    uintptr_t registry = object_at(base + 0x1856b18);
+    if (!registry) HIDE("weapon-table-missing", hunter_class, &state);
+
+    /* sub_6027C7EC(hunter,1) uses the equipment category (distinct from
+     * the player class). The native lookup returns red for these modes. */
+    unsigned type = *(volatile const uint8_t *)(equipment + 1236);
+    uintptr_t weapon = 0;
+    if (type != 4 && type != 5 && type != 6 && type != 10)
+        weapon = find_weapon(registry, equipment + 24); /* sub_600DF814 */
+    if (!weapon) {
+        fixed_tier(&state, 0);
+    } else if (*(volatile const uint8_t *)(hunter + 5068) & 8) {
+        int (*get_color)(uintptr_t) = (int (*)(uintptr_t))method(weapon, 324);
+        if (!get_color) HIDE("weapon-method-missing", hunter_class, &state);
+        int tier = get_color(weapon);
+        fixed_tier(&state, tier < 0 ? 0u : (unsigned)tier);
+    } else {
+        unsigned selector = (*(volatile const uint16_t *)(equipment + 28) >> 5) & 31;
+        GetLevel get_level = (GetLevel)method(weapon, 216);
+        if (!get_level) HIDE("weapon-method-missing", hunter_class, &state);
+        uintptr_t level = get_level(weapon, selector);
+        if (!level)
+            fixed_tier(&state, 0);
+        else if (!level_ends(base, registry, level, &state))
+            HIDE("sharpness-row-missing", hunter_class, &state);
     }
-    state.end[6] = state.maximum;
     log_state("visible", hunter_class, &state);
     *out = state;
     return true;
 }
 
 bool sharpness_read(uintptr_t base, Sharpness *out) {
-    return read_with_tier(base, (TierAt)(base + 0x29cdfc), out);
+    return read_with_weapon(base, (FindWeapon)(base + 0x13f03c), out);
 }

@@ -4,7 +4,7 @@ import ctypes
 import ctypes.util
 import hashlib
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import struct
 import subprocess
@@ -128,13 +128,34 @@ def ips_ranges(data):
         yield site, site + size
 
 
+def damage_module_extent(module):
+    if len(module) < 0x100 or module[:4] != b"NSO0":
+        raise ValueError("Invalid damage-display NSO header")
+    flags = u32(module, 0x0c)
+    file_ranges = []
+    mapped_end = 0
+    for i, name in enumerate((".text", ".rodata", ".data")):
+        offset, address, size = struct.unpack_from("<III", module, 0x10 + 16 * i)
+        stored = u32(module, 0x60 + 4 * i) if flags & (1 << i) else size
+        if size and (not stored or offset < 0x100 or offset + stored > len(module)):
+            raise ValueError(f"Invalid damage-display {name} file range")
+        if (i == 0 and (address != 0 or not size)) or address < mapped_end:
+            raise ValueError(f"Invalid damage-display {name} mapped range")
+        if stored:
+            if not size or any(start < offset + stored and offset < end for start, end in file_ranges):
+                raise ValueError(f"Invalid damage-display {name} file range")
+            file_ranges.append((offset, offset + stored))
+        mapped_end = address + size
+    return (mapped_end + u32(module, 0x3c) + 4095) & ~4095
+
+
 def check_damage_package(path, gauge_ips):
     prefix = "MHGU-Damage-Display/exefs/"
     with ZipFile(path) as archive:
-        module = archive.read(prefix + "subsdk1")
-        if module[:4] != b"NSO0":
-            raise ValueError("Invalid damage-display module")
-        extent = (sum(struct.unpack_from("<III", module, 0x34)) + 4095) & ~4095
+        if any(PurePosixPath(entry.filename.casefold()).parts[-2:] == ("exefs", "subsdk2")
+               for entry in archive.infolist()):
+            raise ValueError("Damage-display package already occupies exefs/subsdk2")
+        extent = damage_module_extent(archive.read(prefix + "subsdk1"))
         if extent != DAMAGE_EXTENT:
             raise ValueError(f"Unsupported damage-display module extent {extent:#x}")
         damage_ips = archive.read(prefix + MAIN_ID.hex().upper() + ".ips")
